@@ -3,6 +3,111 @@
 All notable changes to `@goodandready/dsh-key-rotation` are documented here.
 User-facing feature notes also appear in README (en is source of truth).
 
+## Unreleased
+
+### Features
+- **Per-model per-key token quotas (Provider × Credential Key × Model × Token Quota)**:
+  - `lib/model-quota.js` (new): pure, unit-testable helpers for local token
+    budgets — `normalizeModelQuotas`, `getModelTokenLimit`,
+    `getModelTokenUsage`, `getModelTokenRemaining`, `getModelQuotaStatus`,
+    `isModelQuotaAvailable`, `anyModelQuotaAvailable`, `filterQuotaEligible`,
+    `resetModelQuotaIfNeeded`, `consumeModelTokens`, `extractUsageTokens`.
+    No network, disk, timers or implicit clock; `resetAt` is wall-clock epoch ms
+    from the existing `nextQuotaReset()`.
+  - `lib/pool-index.js` (new): explicit pool ownership. `allPools` /
+    `basePoolByRef` / `modelPoolByRef` / `modelPoolsByProvider` replace
+    `Map<ref, pool>` as the enumeration source, because one ref legitimately
+    belongs to several `provider::model` pools.
+  - `lib/resolver.js` (new): the `credentials.resolve` selector, extracted from
+    `lib/index.js` so request-scoped pool ownership, the quota guard and
+    fail-closed exhaustion are testable without the cordis runtime.
+  - Config: `providers[].models.<model>.quotas.<REF>.tokenLimit`. Missing,
+    null, non-numeric or non-positive means unlimited, so omitting `quotas`
+    preserves the previous behaviour exactly.
+  - State: `pool.state.tokenUsage` is a `Map<ref, {used, resetAt}>` per model
+    pool, which gives Key × Model isolation structurally. Added to
+    `MAP_FIELDS`, `sweepExpired()` pruning and `cleanupRemovedProviders()`.
+  - Accounting: charged on a successful `finish` chunk from the provider's
+    reported `usage` only. Errors, aborts, refusals and retries are never
+    billed, and a response without usage is never guessed at.
+  - Fail closed: when every credential is out of local budget the request is not
+    dispatched and `original(ref)` is **not** used as a bypass; the pool enters
+    the existing exhaustion / cascade flow with `LOCAL_MODEL_QUOTA_EXHAUSTED`.
+    Budget exhaustion never writes `failedUntil`, `failCounts`,
+    `authFailCounts` or `brokenUntil`.
+  - Lazy reset: no per-key timers. The counter rolls over on the first read
+    after `resetAt`.
+  - Persistence: `tokenUsage` is an additive field on the existing
+    `version: 1` snapshot; older files load unchanged, and malformed entries are
+    discarded rather than trusted. Only refs and counters are stored — never a
+    secret and never the configured limit.
+  - Status/health: additive `model` per pool entry, `modelQuota` per key
+    (`null` = unlimited), and quota-aware `healthy` counting so a model pool
+    whose keys all spent their budget reports `exhausted`.
+  - Settings card: per-model credential table with a token-limit input and live
+    `used / limit`, percentage, remaining and reset countdown, or `Unlimited`.
+
+### Fixed
+- **Request-scoped model pool was lost on the dispatch path**: AsyncLocalStorage
+  context is captured when an async generator is created, not when it is
+  iterated. `rotate()` created the inner stream inside `dispatchStorage.run()`
+  but consumed it from outside, so a lazily resolved credential ran with an
+  empty store and the model pool — and therefore the quota guard — was
+  invisible. Iteration now re-enters the store on every step
+  (`preserveDispatchContext`), forwarding `return()` inside the same context so
+  cancellation still closes the upstream stream.
+- **`Map<ref, pool>` could not represent one key in several model pools**:
+  enumerated consumers (persistence cleanup, `compactUsage`, status, health,
+  usage report, budget monitor, webhook pause, sandbox probe endpoint) now use
+  the complete pool set, so model pools are no longer skipped or leaked.
+- **`poolByRef` was hijacked by build order**: the provider-base pool now keeps
+  ownership of a ref it declares, so a bare `credentials.resolve()` outside
+  rotation is deterministic instead of depending on which model pool was built
+  last.
+- **"Provider list unavailable" on DSH desktop 0.1.7-rc.2**: the 0.8.24 fail-closed
+  guard in `isTrustedBridgeRequest` required an `Origin` header on every bridge
+  request. Per the Fetch standard, browsers attach `Origin` to cross-origin
+  requests and to same-origin requests *except* `GET`/`HEAD`, so the Settings
+  card's own same-origin reads arrived without it and were rejected with
+  `403 {"error":{"code":"forbidden"}}`. The card's catalog fetch then failed and
+  rendered "Provider list unavailable" / "提供商列表暂不可用". Every bridge route
+  was affected — `/config`, `/status`, `/health`, `/usage`, `/sandbox-cache` and
+  the mutating routes — so the whole panel degraded to an unavailable state.
+  The guard is now **method-aware**, mirroring exactly when a browser attaches
+  `Origin`: safe methods (`GET`/`HEAD`/`OPTIONS`) may omit it, while
+  `POST`/`PUT`/`PATCH`/`DELETE` must still present a same-origin one. Writes stay
+  strictly fenced, and reads work. Fail-closed properties are retained: the socket
+  peer must be loopback, the `Host` header must itself resolve to a loopback name
+  (which is what blocks DNS rebinding once `Origin` is optional), `sec-fetch-site:
+  cross-site` is refused for every method, and an *attached* `Origin` must still be
+  an http(s) loopback origin whose host equals `Host` — a mismatched or malformed
+  `Origin` is rejected, never ignored.
+- **Provider catalog tolerated only one shape of the `llm` service**:
+  `providerCatalog()` called `ctx.get('llm').listProviders()` unguarded and
+  assumed a synchronous array. On newer cores `llm` members are resolved through
+  the host's service layer and some are remote (RPC-backed), so the call can
+  return a promise or the method can be absent, and the throw escaped the config
+  `GET` handler. Discovery is now guarded, normalises both `{id,name}` and
+  `{provider,displayName}` shapes, skips malformed entries, excludes clone ids
+  and duplicates, and falls back to `listConfigurableProviders()` — the same
+  directory the probe endpoint already used. An empty catalog is reported as
+  unavailable by the card rather than as a thrown error.
+
+### Tests
+- New suites: `bridge-trust` (14 tests, real HTTP server, covering Origin-less
+  same-origin GET/HEAD, Origin-less mutations refused, cross-site refusal,
+  Origin/Host mismatch, DNS-rebinding Host, malformed Origin, IPv6 and port
+  handling) and `provider-catalog` (12 tests, covering sync/async/absent/throwing
+  listings and entry shapes). `routes-live-guard` (4 tests) mounts the real route
+  handlers and asserts the card's exact request shape returns 200.
+- New suites: `model-quota`, `resolver-routing`, `dispatch-context`,
+  `rotate-accounting`, `persistence`, `status-health`, `backward-compat`,
+  `client-config`, `schema`.
+- Restored the `npm test` / `npm run check` entry points declared by
+  `package.json` (`tools/test.mjs`, `tools/check.mjs`) using only Node built-ins.
+- Full run: 133 tests — 132 passing, 0 failing, 1 conditional skip
+  (`@deepseek-ai/schemastery` is a host-provided peer dependency).
+
 ## 0.8.24 - 2026-09-25
 
 ### Security Hardening
